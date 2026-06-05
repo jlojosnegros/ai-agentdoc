@@ -1,0 +1,154 @@
+---
+# .github/workflows/agentdoc.yml
+#
+# Two jobs:
+#   check  — runs on every PR that touches src/ or the overlay. Fails if docs are stale.
+#   maintain — runs on push to main. Invokes Claude Code to repair drift, opens a PR.
+#
+# Secrets required for the "maintain" job only:
+#   ANTHROPIC_API_KEY or Vertex AI credentials (see env block in maintain job)
+#   GITHUB_TOKEN is provided automatically by Actions.
+
+name: Documentation Health
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'cmd/**'
+      - 'docs/agent-overlay.md'
+      - 'CLAUDE.md'
+      - 'Cargo.toml'
+      - 'go.mod'
+      - 'package.json'
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write       # needed by maintain job to push a branch
+  pull-requests: write  # needed by maintain job to open a PR
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # check: fast gate, no Claude Code, runs on every PR
+  # ---------------------------------------------------------------------------
+  check:
+    name: Check documentation freshness
+    runs-on: ubuntu-latest
+    # Only run on PRs (push to main runs maintain instead)
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout (full history required for git log since scan hash)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check documentation health
+        id: agentdoc
+        run: |
+          chmod +x scripts/agentdoc-check.sh
+          ./scripts/agentdoc-check.sh check
+        env:
+          AGENTDOC_FRESHNESS_THRESHOLD: 80
+          AGENTDOC_COMPLETENESS_THRESHOLD: 70
+          AGENTDOC_HUMAN_INPUT_THRESHOLD: 20
+          # Set to "false" if you want the job to warn but not block merges:
+          # AGENTDOC_FAIL_ON_MISSING: "false"
+
+      - name: Upload status artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentdoc-status
+          path: docs/.agentdoc/status.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # maintain: runs on push to main, repairs drift automatically via Claude Code
+  # Opens a PR with the updated docs so a human can review and merge.
+  # ---------------------------------------------------------------------------
+  maintain:
+    name: Maintain documentation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if docs are stale (fast, no Claude Code)
+        id: freshness
+        run: |
+          chmod +x scripts/agentdoc-check.sh
+          # Run status only — don't fail, we want to know if maintain is needed
+          ./scripts/agentdoc-check.sh status
+          # Extract overall_pass from status.json for the next step
+          PASS=$(python3 -c "import json; d=json.load(open('docs/.agentdoc/status.json')); print(d['ci_gates']['overall_pass'])" 2>/dev/null || echo "false")
+          echo "docs_current=$PASS" >> "$GITHUB_OUTPUT"
+        env:
+          AGENTDOC_FRESHNESS_THRESHOLD: 80
+          AGENTDOC_COMPLETENESS_THRESHOLD: 70
+          AGENTDOC_HUMAN_INPUT_THRESHOLD: 20
+
+      - name: Install Claude Code
+        if: steps.freshness.outputs.docs_current == 'false'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run agentdoc maintain via Claude Code
+        if: steps.freshness.outputs.docs_current == 'false'
+        run: claude --print "/agentdoc maintain"
+        env:
+          # Option A: Anthropic API key
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Option B: Vertex AI (comment out Option A and uncomment these)
+          # CLAUDE_CODE_USE_VERTEX: "1"
+          # CLOUD_ML_REGION: ${{ secrets.CLOUD_ML_REGION }}
+          # ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.ANTHROPIC_VERTEX_PROJECT_ID }}
+
+      - name: Check if maintain produced changes
+        if: steps.freshness.outputs.docs_current == 'false'
+        id: changes
+        run: |
+          git diff --quiet docs/ && echo "changed=false" >> "$GITHUB_OUTPUT" \
+                                 || echo "changed=true"  >> "$GITHUB_OUTPUT"
+
+      - name: Open PR with updated docs
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          BRANCH="agentdoc/maintain-$(date +%Y%m%d-%H%M%S)"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add docs/agent-overlay.md docs/.agentdoc/claims.yml docs/.agentdoc/status.json
+          git commit -s -m "docs: agentdoc maintain — repair drift after $(git rev-parse --short HEAD~1)"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "docs: agentdoc maintain [bot]" \
+            --body "$(cat <<'EOF'
+## Automated documentation maintenance
+
+agentdoc detected drift between source code and \`docs/agent-overlay.md\` after the
+latest push to main. This PR contains the auto-repaired changes.
+
+**What to review:**
+- Check sections with \`<!-- agentdoc:review-needed: -->\` comments — these are flagged
+  for human review because the drift was semantic (behavioral change), not mechanical.
+- If \`human_input\` was updated, verify the score is accurate.
+- If new claims were added to \`docs/.agentdoc/claims.yml\`, verify they are correct.
+
+**What was auto-fixed:**
+- Mechanical drift: renamed paths, renamed types, updated commands.
+
+🤖 Generated by agentdoc maintain — review before merging.
+EOF
+)" \
+            --label "documentation" \
+            --label "bot"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

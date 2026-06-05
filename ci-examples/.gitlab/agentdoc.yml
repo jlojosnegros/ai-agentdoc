@@ -1,0 +1,148 @@
+# .gitlab-ci.yml snippet — agentdoc integration
+#
+# Include this file in your .gitlab-ci.yml with:
+#   include:
+#     - local: .gitlab/agentdoc.yml
+#
+# Or copy the jobs directly into your .gitlab-ci.yml.
+#
+# Two jobs:
+#   agentdoc:check    — MR gate. Fails if docs are stale. No Claude Code required.
+#   agentdoc:maintain — Post-merge pipeline. Repairs drift via Claude Code, opens MR.
+#
+# CI/CD variables required (Settings → CI/CD → Variables):
+#   For the maintain job only:
+#     ANTHROPIC_API_KEY         (masked, protected) — if using Anthropic API directly
+#     OR:
+#     CLAUDE_CODE_USE_VERTEX    = "1"
+#     CLOUD_ML_REGION           (masked)
+#     ANTHROPIC_VERTEX_PROJECT_ID (masked)
+#
+# GITLAB_TOKEN (or CI_JOB_TOKEN with api scope) is needed for the maintain job
+# to push a branch and open an MR. Use a project access token with write_repository
+# and create_merge_request scopes.
+
+variables:
+  AGENTDOC_FRESHNESS_THRESHOLD: "80"
+  AGENTDOC_COMPLETENESS_THRESHOLD: "70"
+  AGENTDOC_HUMAN_INPUT_THRESHOLD: "20"
+  AGENTDOC_OVERLAY_PATH: "docs/agent-overlay.md"
+
+# ---------------------------------------------------------------------------
+# check: MR gate — fast, no Claude Code
+# ---------------------------------------------------------------------------
+agentdoc:check:
+  stage: test
+  image: alpine/git:latest
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - chmod +x scripts/agentdoc-check.sh
+    - ./scripts/agentdoc-check.sh check
+  variables:
+    GIT_DEPTH: 0                 # Full history needed for git log since scan hash
+    GIT_STRATEGY: fetch
+  artifacts:
+    when: always
+    paths:
+      - docs/.agentdoc/status.json
+    reports:
+      dotenv: docs/.agentdoc/status.json   # Optional: expose values to downstream jobs
+    expire_in: 7 days
+  rules:
+    # Run on MRs that touch source or docs
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - src/**/*
+        - lib/**/*
+        - cmd/**/*
+        - docs/agent-overlay.md
+        - CLAUDE.md
+        - Cargo.toml
+        - go.mod
+        - package.json
+    # Always run if the overlay itself is touched
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - docs/agent-overlay.md
+  allow_failure: false           # Set to true if you want warning-only mode
+
+# ---------------------------------------------------------------------------
+# maintain: post-merge — repairs drift, opens an MR with the updated docs
+# ---------------------------------------------------------------------------
+agentdoc:maintain:
+  stage: post-deploy
+  image: node:22-alpine
+  before_script:
+    - apk add --no-cache bash git python3
+    - npm install -g @anthropic-ai/claude-code
+    - git config user.name  "agentdoc-bot"
+    - git config user.email "agentdoc-bot@gitlab"
+  script:
+    # Step 1: check if docs are stale (fast, no Claude Code)
+    - chmod +x scripts/agentdoc-check.sh
+    - |
+      ./scripts/agentdoc-check.sh status || true
+      DOCS_CURRENT=$(python3 -c "
+      import json
+      d = json.load(open('docs/.agentdoc/status.json'))
+      print('true' if d['ci_gates']['overall_pass'] else 'false')
+      " 2>/dev/null || echo "false")
+      echo "DOCS_CURRENT=$DOCS_CURRENT" >> maintain.env
+
+    # Step 2: run maintain only if stale
+    - source maintain.env
+    - |
+      if [ "$DOCS_CURRENT" = "false" ]; then
+        echo "Docs are stale — running agentdoc maintain..."
+        claude --print "/agentdoc maintain"
+      else
+        echo "Docs are current — nothing to do."
+        exit 0
+      fi
+
+    # Step 3: check if maintain produced changes
+    - |
+      if git diff --quiet docs/; then
+        echo "No changes after maintain — nothing to push."
+        exit 0
+      fi
+
+    # Step 4: push branch and open MR
+    - |
+      BRANCH="agentdoc/maintain-$(date +%Y%m%d-%H%M%S)"
+      git checkout -b "$BRANCH"
+      git add docs/agent-overlay.md docs/.agentdoc/claims.yml docs/.agentdoc/status.json
+      git commit -s -m "docs: agentdoc maintain — repair drift after ${CI_COMMIT_SHORT_SHA}"
+      git push "https://agentdoc-bot:${GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "$BRANCH"
+
+      # Open MR via GitLab API
+      curl --silent --fail \
+        --request POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests" \
+        --data "{
+          \"source_branch\": \"${BRANCH}\",
+          \"target_branch\": \"${CI_DEFAULT_BRANCH}\",
+          \"title\": \"docs: agentdoc maintain [bot]\",
+          \"description\": \"## Automated documentation maintenance\n\nagentdoc detected drift between source code and \`docs/agent-overlay.md\` after the latest push to \`${CI_DEFAULT_BRANCH}\`.\n\n**What to review:**\n- Sections with \`<!-- agentdoc:review-needed: -->\` comments — semantic drift, needs human review.\n- New claims in \`docs/.agentdoc/claims.yml\` — verify they are correct.\n\n**What was auto-fixed:**\n- Mechanical drift: renamed paths, renamed types, updated commands.\n\n🤖 Generated by agentdoc maintain — review before merging.\",
+          \"labels\": \"documentation,bot\",
+          \"remove_source_branch\": true
+        }"
+  variables:
+    GIT_DEPTH: 0
+    GIT_STRATEGY: fetch
+  artifacts:
+    when: always
+    paths:
+      - docs/.agentdoc/status.json
+    expire_in: 7 days
+  environment:
+    name: documentation
+  rules:
+    # Run only on push to default branch
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+  # Secrets needed:
+  # ANTHROPIC_API_KEY or Vertex AI vars (see top of file)
+  # GITLAB_TOKEN: project access token with write_repository + api scopes

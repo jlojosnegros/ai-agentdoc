@@ -83,10 +83,10 @@ ${BOLD}EXAMPLES${RESET}
 
 ${BOLD}WHAT GETS INSTALLED${RESET}
   global:
-    ~/.claude/skills/agentdoc.md
+    ~/.claude/skills/agentdoc/SKILL.md
 
   local:
-    <root>/.claude/skills/agentdoc.md
+    <root>/.claude/skills/agentdoc/SKILL.md
 
   local --ci-install (additional):
     <root>/scripts/agentdoc-check.sh  (chmod +x applied)
@@ -176,9 +176,9 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ "$MODE" == "global" ]]; then
-    SKILL_DEST="$HOME/.claude/skills/agentdoc.md"
+    SKILL_DEST="$HOME/.claude/skills/agentdoc/SKILL.md"
 else
-    SKILL_DEST="$ROOT/.claude/skills/agentdoc.md"
+    SKILL_DEST="$ROOT/.claude/skills/agentdoc/SKILL.md"
 fi
 
 CI_SCRIPT_DEST=""

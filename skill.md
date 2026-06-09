@@ -4,7 +4,7 @@ Generate and maintain AI-agent-oriented documentation that combines a lightweigh
 root-level `CLAUDE.md` with a deep `docs/agent-overlay.md`, both equipped with
 drift detection, freshness scoring, and protection for human-written sections.
 
-Install: copy this file to `.claude/skills/agentdoc.md` in the target repo.
+Install: copy this file to `.claude/skills/agentdoc/SKILL.md` in the target repo.
 Invoke: `/agentdoc [init [--mode single|multi]|migrate|draft|maintain|status] ["context hint"]`
 
 `--mode single` (default): one overlay covers the whole repo.
